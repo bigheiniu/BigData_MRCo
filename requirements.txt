@@ -1,0 +1,14 @@
+transformers==4.6.1
+ray
+ray[tune]
+datasets
+tqdm
+pandas
+numpy
+tensorboard
+tokenizers
+seqeval
+pyspark
+pytorch-lightning==1.3.5
+pytz
+pandarallel
