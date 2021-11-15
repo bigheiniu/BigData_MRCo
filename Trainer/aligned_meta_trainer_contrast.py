@@ -286,7 +286,6 @@ class AlignedMetaContrastTrainer(MetaTrainer):
         if self.hparams.is_time_prior:
             self._time_priority_dequeue_and_enqueue(pos_k, weight_score, label_index)
         else:
-            # ATTENTION: BUG here.
             self._weight_priority_dequeue_and_enqueue(pos_k, weight_score, label_index)
         print(self.global_rank, "end of inner")
 
