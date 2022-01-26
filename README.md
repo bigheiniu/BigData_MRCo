@@ -35,6 +35,17 @@ If you are interested in this paper, please consider cite our work:
  - Guanyi Mou[^1], Yichuan Li[^1], Kyumin Lee
 
  [^1]: Equal contribution.
+ 
+ ```
+ @inproceedings{mou2021reducing,
+  title={Reducing and Exploiting Data Augmentation Noise through Meta Reweighting Contrastive Learning for Text Classification},
+  author={Mou, Guanyi and Li, Yichuan and Lee, Kyumin},
+  booktitle={2021 IEEE International Conference on Big Data (Big Data)},
+  pages={876--887},
+  year={2021},
+  organization={IEEE}
+}
+```
 
 
 
