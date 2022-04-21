@@ -276,6 +276,179 @@ class OfflineAugmentDataset(torch.utils.data.Dataset):
         else:
             return torch.tensor(self.clean_data[item]['encode']), torch.tensor(self.clean_data[item]['class'])
 
+class OfflineAugmentDatasetSpeedUp(torch.utils.data.Dataset):
+    def __init__(self, hparams, data_flag, is_meta=False):
+        self.hparams = hparams
+        self.data_flag = data_flag
+        self.is_roberta = getattr(self.hparams, "is_roberta", False)
+        self.is_meta = is_meta
+        self.two_sentence = False
+        if self.data_flag == "train":
+            '''
+            load training dataset
+            '''
+            # instance, label
+            train_data = self.load_json_file(hparams.train_data_path)
+            train_aug_data = self.load_json_file(hparams.train_aug_data_path)
+            # manually filter the low quality augmented data
+            # select interested augmentation method
+            # ATTENTION: Pad the sample with the readability score and cola score
+            if 'readability' not in train_aug_data[0].keys():
+                read_score_label = [i for i in train_aug_data[0].keys() if "Score" in i]
+                if len(read_score_label) == 0:
+                    train_aug_data = [{**i, 'readability': 10, 'cola': 0.5} for i in train_aug_data]
+                    train_data = [{**i, 'readability': 10, 'cola': 0.5} for i in train_data]
+                elif len(read_score_label) == 1:
+                    train_aug_data = [{**i, 'readability': i[read_score_label[0]], 'cola': 0.5} for i in train_aug_data]
+                    train_data = [{**i, 'readability': 10, 'cola': 0.5} for i in train_data]
+                else:
+                    # TODO: this is placeholder to be compatiable with the model
+                    train_aug_data = [{**i, 'readability': 10, 'readability1': i[read_score_label[0]],
+                                       'readability2': i[read_score_label[1]], 'cola': 0.5} for i in train_aug_data]
+                    train_data = [{**i, 'readability': 10, 'cola': 0.5, "encode":i['encode']} for i in train_data]
+                    self.two_sentence = True
+
+            if "label" in train_data[0].keys():
+                train_aug_data = [{**i, "class": i['label']} for i in train_aug_data]
+                train_data = [{**i, 'class': i['label']} for i in train_data]
+
+            # stsb is not a binary task
+            train_aug_data = self.filter_mechanism(train_aug_data, self.hparams.aug_method,
+                                                   self.hparams.read_score_interval)
+            if self.two_sentence and self.is_roberta:
+                train_aug_data = [{**i, "encode": i['encode']} for i in train_aug_data]
+                train_data = [{**i, "encode": i['encode']} for i in train_data]
+
+            if len(train_aug_data) == 0:
+                # hard filter cause no augmented data left.
+                exit(-1)
+            train_clean_data, train_meta_data, train_aug_data, train_clean_index = \
+                self.get_train_samples(train_data,
+                                       train_aug_data,
+                                       hparams.train_count,
+                                       hparams.clean_count)
+
+            if self.is_meta is False:
+                # aligned the raw samples and augmented samples for contrastive learning
+                # In the length_align only expand the meta-learning samples.
+                self.train_clean_data, self.train_aug_data = self.sample_align(train_clean_data, train_aug_data)
+                assert len(self.train_clean_data) == len(self.train_aug_data)
+            else:
+                self.clean_data = train_meta_data
+            # print('train', len(self.clean_data))
+
+        # val_clean_data
+        elif self.data_flag == 'val':
+            self.clean_data = self.load_json_file(hparams.val_data_path)
+            if "label" in self.clean_data[0].keys():
+                self.clean_data = [{**i, 'class': i['label']} for i in self.clean_data]
+            if self.two_sentence and self.is_roberta:
+                self.clean_data = [{**i, "encode": i['encode']} for i in self.clean_data]
+            # print('val', len(self.clean_data))
+
+        else:
+            self.clean_data = self.load_json_file(hparams.test_data_path)
+            if "label" in self.clean_data[0].keys():
+                self.clean_data = [{**i, 'class': i['label']} for i in self.clean_data]
+            if self.two_sentence and self.is_roberta:
+                self.clean_data = [{**i, "encode": i['encode']} for i in self.clean_data]
+            # print('test', len(self.clean_data))
+
+
+    def like_glue(self, encode):
+        seperate_index = encode.index(0, 1, len(encode))
+        encode = encode[:seperate_index] + [2, 2] + encode[seperate_index+1:]
+        return encode
+
+    def load_json_file(self, file_name):
+        data = []
+        with open(file_name, 'r') as f1:
+            for line in f1.readlines():
+                data.append(json.loads(line))
+        return data
+    # ATTENTION: no length align. Will this cause problem?
+
+    def sample_align(self, train_clean_data, train_aug_data):
+        train_clean_df = pd.DataFrame(train_clean_data)
+        train_aug_df = pd.DataFrame(train_aug_data)
+        aligned_samples = pd.merge(train_clean_df, train_aug_df, how='inner', left_on='index', right_on='origin',
+                                   suffixes=("_raw", '_aug'))
+        clean_columns = [i for i in aligned_samples.columns if "_raw" in i]
+        aug_columns = [i for i in aligned_samples.columns if "_aug" in i]
+        train_clean_df = aligned_samples[clean_columns]
+        train_aug_df = aligned_samples[aug_columns]
+        train_clean_data = train_clean_df.rename(columns=lambda x: x.replace("_raw", "")).to_dict(orient="records")
+        train_aug_data = train_aug_df.rename(columns=lambda x: x.replace("_aug", "")).to_dict(orient="records")
+        return train_clean_data, train_aug_data
+
+    def get_train_samples(self, train_data, train_aug_data, train_count, clean_count):
+        # access limited number of training dataset
+        # ATTENTION: the meta-train dataset has no overlap with the aug training dataset
+        if train_count != -1:
+            train_data, _ = train_test_split(train_data, stratify=[i['class'] for i in train_data],
+                                             train_size=train_count)
+        if clean_count != -1:
+            if self.hparams.class_num == 1:
+                train_clean_data, train_meta_data = train_test_split(train_data, train_size=clean_count)
+            else:
+                train_clean_data, train_meta_data = \
+                    train_test_split(train_data, stratify=[i['class'] for i in train_data],
+                                     train_size=clean_count)
+        else:
+            # baseline method does not need meta split
+            train_clean_data = train_data
+            train_meta_data = train_data
+        train_clean_index = set([i['index'] for i in train_clean_data])
+        # ATTENTION: this will enlarge the size of the training dataset,
+        # pls check the length alignment function for details.
+        train_aug_data = [i for i in train_aug_data if i['origin'] in train_clean_index]
+
+        return train_clean_data, train_meta_data, train_aug_data, train_clean_index
+
+    def filter_mechanism(self, train_aug_data, aug_method, read_score_interval):
+        # TODO: filter low quality samples
+        if aug_method != "all":
+            aug_method = set(aug_method.split(","))
+            train_aug_data = [i for i in train_aug_data if i['aug_method'] in aug_method]
+        read_score_interval = read_score_interval.split("+")
+        if self.two_sentence is False:
+            train_aug_data = [i for i in train_aug_data
+                              if (float(read_score_interval[0]) < i['readability'] < float(read_score_interval[1]))]
+        else:
+            train_aug_data = [i for i in train_aug_data
+                              if (float(read_score_interval[0]) < i['readability1'] < float(read_score_interval[1])) and
+                              (float(read_score_interval[0]) < i['readability2'] < float(read_score_interval[1]))
+                              ]
+
+        # cola_score_interval = cola_score_interval.split(",")
+        #     train_aug_data = [i for i in train_aug_data
+        #                   if (float(cola_score_interval[0]) < i['cola'] < float(cola_score_interval[1]))]
+        return train_aug_data
+
+    def flip_debug(self, y_aug):
+        # to see whether the meta_weight function can identify the flip label(noise samples)
+        flip_pro = getattr(self.hparams, "debug_flip_pro", 0.4)
+        flip_indicator = np.random.binomial(1, flip_pro, len(y_aug))
+        flipped_label = np.where(flip_indicator == 1, 1 - y_aug, y_aug)
+        return flipped_label
+
+    def __len__(self):
+        if self.data_flag == "train" and self.is_meta is False:
+            return len(self.train_clean_data)
+        else:
+            return len(self.clean_data)
+
+    def __getitem__(self, item):
+        if self.data_flag == 'train' and self.is_meta is False:
+            return torch.tensor(self.train_clean_data[item]['encode']), torch.tensor(self.train_clean_data[item]['class']), torch.tensor(self.train_aug_data[item]['encode']), torch.tensor(self.train_aug_data[item]['class'])
+            # group_index = self.group_index_list[item]
+            # clean_data = self.grouped_samples.get_group(group_index).iloc[0, :].to_dict()
+            # aug_data = self.grouped_samples.get_group(group_index).to_dict(orient='records')
+            # return clean_data['encode_raw'], clean_data['class_raw'], [i['encode_aug'] for i in aug_data], [i['class_aug'] for i in aug_data]
+
+        else:
+            return torch.tensor(self.clean_data[item]['encode']), torch.tensor(self.clean_data[item]['class'])
+
 
 def expand_list(elements, max_lenth):
     elements = elements * int(max_lenth / len(elements))
